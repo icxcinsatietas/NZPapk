@@ -1,0 +1,388 @@
+name: NZP APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p nzp-android && cd nzp-android
+          mkdir -p app
+          cat > app/build.gradle.kts <<'NZP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          dependencies { implementation("androidx.appcompat:appcompat:1.7.0") }
+          android {
+              namespace = "gay.nzp.wrapper"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "gay.nzp.wrapper"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          NZP_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'NZP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="NZ:P"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          NZP_EOF
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/touch.js <<'NZP_EOF'
+          if (!window.__nzpTouch) { window.__nzpTouch = true;
+          // Pointer lock shim: Android WebView lacks the Pointer Lock API
+          if (typeof Element.prototype.requestPointerLock !== 'function') {
+            let locked = null;
+            Object.defineProperty(document, 'pointerLockElement', { get: () => locked });
+            Element.prototype.requestPointerLock = function () { locked = this; document.dispatchEvent(new Event('pointerlockchange')); };
+            document.exitPointerLock = function () { locked = null; document.dispatchEvent(new Event('pointerlockchange')); };
+          }
+          (() => {
+            'use strict';
+
+            // ---- CONFIG: [key, code, keyCode]. Adjust to match NZ:P's Options > Controls ----
+            const K = {
+              fwd: ['w', 'KeyW', 87], back: ['s', 'KeyS', 83],
+              left: ['a', 'KeyA', 65], right: ['d', 'KeyD', 68],
+              jump: [' ', 'Space', 32], reload: ['r', 'KeyR', 82],
+              use: ['e', 'KeyE', 69], sprint: ['Shift', 'ShiftLeft', 16],
+              crouch: ['Control', 'ControlLeft', 17], knife: ['f', 'KeyF', 70],
+              grenade: ['g', 'KeyG', 71], menu: ['Escape', 'Escape', 27],
+            };
+            const LOOK_SENS = 1.6;   // touch-look speed multiplier
+            const STICK_R = 60;      // joystick radius in px
+            const DEADZONE = 0.3;
+
+            const canvas = () => document.getElementById('canvas') || document.querySelector('canvas');
+
+            function sendKey(type, def) {
+              const [key, code, kc] = def;
+              const e = new KeyboardEvent(type, { key, code, bubbles: true, cancelable: true });
+              Object.defineProperty(e, 'keyCode', { get: () => kc });
+              Object.defineProperty(e, 'which', { get: () => kc });
+              (canvas() || document).dispatchEvent(e);
+            }
+            function sendMouse(type, button) {
+              (canvas() || document).dispatchEvent(new MouseEvent(type, {
+                button, buttons: type === 'mouseup' ? 0 : 1 << (button === 2 ? 1 : 0), bubbles: true, cancelable: true,
+              }));
+            }
+            function sendLook(dx, dy) {
+              (canvas() || document).dispatchEvent(new MouseEvent('mousemove', {
+                movementX: dx * LOOK_SENS, movementY: dy * LOOK_SENS, bubbles: true,
+              }));
+            }
+            function sendWheel(dy) {
+              (canvas() || document).dispatchEvent(new WheelEvent('wheel', { deltaY: dy, bubbles: true, cancelable: true }));
+            }
+
+            // ---- Styles ----
+            const css = document.createElement('style');
+            css.textContent = `
+              #nzt *{box-sizing:border-box;-webkit-user-select:none;user-select:none;touch-action:none}
+              #nzt{position:fixed;inset:0;z-index:2147483647;pointer-events:none}
+              #nzt .zone{position:absolute;top:0;bottom:0;pointer-events:auto}
+              #nzt .ring,#nzt .knob{position:absolute;border-radius:50%;display:none}
+              #nzt .ring{width:${STICK_R * 2}px;height:${STICK_R * 2}px;border:2px solid rgba(255,255,255,.35);background:rgba(0,0,0,.2)}
+              #nzt .knob{width:56px;height:56px;background:rgba(255,255,255,.45)}
+              #nzt .btn{position:absolute;pointer-events:auto;border-radius:50%;display:flex;align-items:center;justify-content:center;
+                color:#fff;font:600 12px sans-serif;background:rgba(0,0,0,.45);border:2px solid rgba(255,255,255,.4)}
+              #nzt .btn.on{background:rgba(180,30,30,.7)}
+            `;
+            document.head.appendChild(css);
+
+            const root = document.createElement('div');
+            root.id = 'nzt';
+            document.body.appendChild(root);
+
+            // ---- Fullscreen / pointer lock / landscape on first touch ----
+            let primed = false;
+            function prime() {
+              if (primed) return;
+              primed = true;
+              const el = document.documentElement;
+              (el.requestFullscreen ? el.requestFullscreen() : Promise.resolve())
+                .catch(() => {})
+                .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape'))
+                .catch(() => {});
+              const c = canvas();
+              if (c && c.requestPointerLock) try { c.requestPointerLock(); } catch (e) {}
+            }
+
+            // ---- Look zone (right half) ----
+            const look = document.createElement('div');
+            look.className = 'zone';
+            look.style.cssText = 'left:45%;right:0';
+            root.appendChild(look);
+            let lookId = null, lx = 0, ly = 0;
+            look.addEventListener('pointerdown', e => {
+              prime();
+              if (lookId !== null) return;
+              lookId = e.pointerId; lx = e.clientX; ly = e.clientY;
+              look.setPointerCapture(lookId);
+            });
+            look.addEventListener('pointermove', e => {
+              if (e.pointerId !== lookId) return;
+              sendLook(e.clientX - lx, e.clientY - ly);
+              lx = e.clientX; ly = e.clientY;
+            });
+            const endLook = e => { if (e.pointerId === lookId) lookId = null; };
+            look.addEventListener('pointerup', endLook);
+            look.addEventListener('pointercancel', endLook);
+
+            // ---- Floating joystick (left side) ----
+            const stickZone = document.createElement('div');
+            stickZone.className = 'zone';
+            stickZone.style.cssText = 'left:0;width:45%';
+            const ring = document.createElement('div'); ring.className = 'ring';
+            const knob = document.createElement('div'); knob.className = 'knob';
+            stickZone.append(ring, knob);
+            root.appendChild(stickZone);
+
+            let stickId = null, cx = 0, cy = 0;
+            const held = { fwd: false, back: false, left: false, right: false };
+            function setDir(name, on) {
+              if (held[name] === on) return;
+              held[name] = on;
+              sendKey(on ? 'keydown' : 'keyup', K[name]);
+            }
+            function releaseStick() {
+              Object.keys(held).forEach(n => setDir(n, false));
+              ring.style.display = knob.style.display = 'none';
+            }
+            stickZone.addEventListener('pointerdown', e => {
+              prime();
+              if (stickId !== null) return;
+              stickId = e.pointerId; cx = e.clientX; cy = e.clientY;
+              stickZone.setPointerCapture(stickId);
+              ring.style.cssText = `display:block;left:${cx - STICK_R}px;top:${cy - STICK_R}px`;
+              knob.style.cssText = `display:block;left:${cx - 28}px;top:${cy - 28}px`;
+            });
+            stickZone.addEventListener('pointermove', e => {
+              if (e.pointerId !== stickId) return;
+              let dx = e.clientX - cx, dy = e.clientY - cy;
+              const d = Math.hypot(dx, dy) || 1;
+              const m = Math.min(d, STICK_R);
+              knob.style.left = `${cx + (dx / d) * m - 28}px`;
+              knob.style.top = `${cy + (dy / d) * m - 28}px`;
+              const nx = dx / STICK_R, ny = dy / STICK_R;
+              setDir('fwd', ny < -DEADZONE);
+              setDir('back', ny > DEADZONE);
+              setDir('left', nx < -DEADZONE);
+              setDir('right', nx > DEADZONE);
+            });
+            const endStick = e => { if (e.pointerId === stickId) { stickId = null; releaseStick(); } };
+            stickZone.addEventListener('pointerup', endStick);
+            stickZone.addEventListener('pointercancel', endStick);
+
+            // ---- Buttons ----
+            // [label, right%, bottom%, size px, down(), up(), toggle?]
+            const keyBtn = def => [() => sendKey('keydown', def), () => sendKey('keyup', def)];
+            const BUTTONS = [
+              ['FIRE', 4, 28, 84, () => sendMouse('mousedown', 0), () => sendMouse('mouseup', 0)],
+              ['AIM', 17, 40, 62, () => sendMouse('mousedown', 2), () => sendMouse('mouseup', 2)],
+              ['JUMP', 4, 6, 62, ...keyBtn(K.jump)],
+              ['RELOAD', 15, 8, 56, ...keyBtn(K.reload)],
+              ['USE', 24, 22, 52, ...keyBtn(K.use)],
+              ['KNIFE', 27, 36, 50, ...keyBtn(K.knife)],
+              ['NADE', 28, 52, 50, ...keyBtn(K.grenade)],
+              ['SWAP', 4, 60, 50, () => sendWheel(100), () => {}],
+              ['SPRINT', 3, 82, 50, ...keyBtn(K.sprint), true],
+              ['CROUCH', 12, 82, 50, ...keyBtn(K.crouch), true],
+              ['MENU', 22, 88, 44, ...keyBtn(K.menu)],
+            ];
+            BUTTONS.forEach(([label, r, b, size, down, up, toggle]) => {
+              const el = document.createElement('div');
+              el.className = 'btn';
+              el.textContent = label;
+              el.style.cssText = `right:${r}%;bottom:${b}%;width:${size}px;height:${size}px`;
+              let isOn = false;
+              el.addEventListener('pointerdown', e => {
+                e.stopPropagation(); prime();
+                el.setPointerCapture(e.pointerId);
+                if (toggle) { isOn = !isOn; el.classList.toggle('on', isOn); (isOn ? down : up)(); return; }
+                el.classList.add('on'); down();
+              });
+              const release = () => { if (toggle) return; el.classList.remove('on'); up(); };
+              el.addEventListener('pointerup', release);
+              el.addEventListener('pointercancel', release);
+              root.appendChild(el);
+            });
+
+            // Stop the page scrolling or zooming under the overlay
+            document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+          })();
+          }
+          NZP_EOF
+          mkdir -p app/src/main/java/gay/nzp/wrapper
+          cat > app/src/main/java/gay/nzp/wrapper/MainActivity.kt <<'NZP_EOF'
+          package gay.nzp.wrapper
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.View
+          import android.view.WindowManager
+          import android.webkit.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+
+          class MainActivity : Activity() {
+              private var web: WebView? = null
+              private val startUrl = "https://nzp.gay/"
+              private val crashFile: File get() = File(filesDir, "crash.txt")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Thread.setDefaultUncaughtExceptionHandler { _, e ->
+                      try { crashFile.writeText(android.util.Log.getStackTraceString(e)) } catch (_: Throwable) {}
+                      android.os.Process.killProcess(android.os.Process.myPid())
+                  }
+                  if (crashFile.exists()) { showError(crashFile.readText()); return }
+                  try { startGame() } catch (t: Throwable) { showError(android.util.Log.getStackTraceString(t)) }
+              }
+
+              private fun showError(msg: String) {
+                  val tv = TextView(this)
+                  tv.text = "NZ:P crashed. Screenshot this and send it:\n\n" + msg
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = 11f
+                  tv.setTextIsSelectable(true)
+                  tv.setPadding(24, 24, 24, 24)
+                  val btn = Button(this)
+                  btn.text = "Clear and retry"
+                  btn.setOnClickListener { crashFile.delete(); recreate() }
+                  val scroll = ScrollView(this)
+                  scroll.addView(tv)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setBackgroundColor(Color.BLACK)
+                  col.addView(btn)
+                  col.addView(scroll)
+                  setContentView(col)
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun startGame() {
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val w = WebView(this)
+                  web = w
+                  setContentView(w)
+                  hideSystemBars()
+
+                  w.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      cacheMode = WebSettings.LOAD_DEFAULT
+                      useWideViewPort = true
+                      loadWithOverviewMode = true
+                  }
+                  w.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+
+                  val touchJs = assets.open("touch.js").bufferedReader().use { it.readText() }
+                  w.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                          val host = r.url.host ?: return true
+                          return !(host == "nzp.gay" || host.endsWith("nzp-team.github.io"))
+                      }
+                      override fun onPageFinished(v: WebView, url: String) {
+                          v.evaluateJavascript(touchJs, null)
+                      }
+                      override fun onRenderProcessGone(v: WebView, d: RenderProcessGoneDetail): Boolean {
+                          showError("WebView render process gone. didCrash=" + d.didCrash())
+                          return true
+                      }
+                  }
+                  w.webChromeClient = WebChromeClient()
+                  w.loadUrl(startUrl)
+              }
+
+              private fun hideSystemBars() {
+                  @Suppress("DEPRECATION")
+                  window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+              }
+              override fun onWindowFocusChanged(hasFocus: Boolean) { super.onWindowFocusChanged(hasFocus); if (hasFocus && web != null) hideSystemBars() }
+              override fun onPause() { web?.onPause(); super.onPause() }
+              override fun onResume() { super.onResume(); web?.onResume() }
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() { /* ignore: avoid leaving mid-game */ }
+          }
+          NZP_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'NZP_EOF'
+          <resources><string name="app_name">NZ:P</string></resources>
+          NZP_EOF
+          cat > build.gradle.kts <<'NZP_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          NZP_EOF
+          cat > gradle.properties <<'NZP_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          NZP_EOF
+          cat > settings.gradle.kts <<'NZP_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NZPortable"
+          include(":app")
+          NZP_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: nzp-android
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nzp-apk
+          path: nzp-android/app/build/outputs/apk/debug/app-debug.apk
+          
