@@ -1,0 +1,199 @@
+name: NZP APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p nzp-android && cd nzp-android
+          mkdir -p app
+          cat > app/build.gradle.kts <<'NZP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          dependencies { implementation("androidx.appcompat:appcompat:1.7.0") }
+          android {
+              namespace = "gay.nzp.wrapper"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "gay.nzp.wrapper"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          NZP_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'NZP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="NZ:P"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          NZP_EOF
+          mkdir -p app/src/main/java/gay/nzp/wrapper
+          cat > app/src/main/java/gay/nzp/wrapper/MainActivity.kt <<'NZP_EOF'
+          package gay.nzp.wrapper
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.View
+          import android.view.WindowManager
+          import android.webkit.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+
+          class MainActivity : Activity() {
+              private var web: WebView? = null
+              private val startUrl = "https://nzp.gay/"
+              private val crashFile: File get() = File(filesDir, "crash.txt")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Thread.setDefaultUncaughtExceptionHandler { _, e ->
+                      try { crashFile.writeText(android.util.Log.getStackTraceString(e)) } catch (_: Throwable) {}
+                      android.os.Process.killProcess(android.os.Process.myPid())
+                  }
+                  if (crashFile.exists()) { showError(crashFile.readText()); return }
+                  try { startGame() } catch (t: Throwable) { showError(android.util.Log.getStackTraceString(t)) }
+              }
+
+              private fun showError(msg: String) {
+                  val tv = TextView(this)
+                  tv.text = "NZ:P crashed. Screenshot this and send it:\n\n" + msg
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = 11f
+                  tv.setTextIsSelectable(true)
+                  tv.setPadding(24, 24, 24, 24)
+                  val btn = Button(this)
+                  btn.text = "Clear and retry"
+                  btn.setOnClickListener { crashFile.delete(); recreate() }
+                  val scroll = ScrollView(this)
+                  scroll.addView(tv)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setBackgroundColor(Color.BLACK)
+                  col.addView(btn)
+                  col.addView(scroll)
+                  setContentView(col)
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun startGame() {
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val w = WebView(this)
+                  web = w
+                  setContentView(w)
+                  hideSystemBars()
+
+                  w.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      cacheMode = WebSettings.LOAD_DEFAULT
+                      useWideViewPort = true
+                      loadWithOverviewMode = true
+                  }
+                  w.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+
+                  w.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                          val host = r.url.host ?: return true
+                          return !(host == "nzp.gay" || host.endsWith("nzp-team.github.io"))
+                      }
+                      override fun onRenderProcessGone(v: WebView, d: RenderProcessGoneDetail): Boolean {
+                          showError("WebView render process gone. didCrash=" + d.didCrash())
+                          return true
+                      }
+                  }
+                  w.webChromeClient = WebChromeClient()
+                  w.isFocusable = true
+                  w.isFocusableInTouchMode = true
+                  w.requestFocus()
+                  w.loadUrl(startUrl)
+              }
+
+              private fun hideSystemBars() {
+                  @Suppress("DEPRECATION")
+                  window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+              }
+              override fun onWindowFocusChanged(hasFocus: Boolean) { super.onWindowFocusChanged(hasFocus); if (hasFocus && web != null) hideSystemBars() }
+              override fun onPause() { web?.onPause(); super.onPause() }
+              override fun onResume() { super.onResume(); web?.onResume() }
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() { /* ignore: avoid leaving mid-game */ }
+          }
+          NZP_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'NZP_EOF'
+          <resources><string name="app_name">NZ:P</string></resources>
+          NZP_EOF
+          cat > build.gradle.kts <<'NZP_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          NZP_EOF
+          cat > gradle.properties <<'NZP_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          NZP_EOF
+          cat > settings.gradle.kts <<'NZP_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NZPortable"
+          include(":app")
+          NZP_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: nzp-android
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nzp-apk
+          path: nzp-android/app/build/outputs/apk/debug/app-debug.apk
